@@ -1,260 +1,307 @@
-import tkinter as tk
-from tkinter import messagebox
-import csv
-import os
+import streamlit as st
 import random
+import pandas as pd
+import os
+import csv
+from datetime import datetime
 
-# Define the User class
+# Denomination Manager for handling ATM denominations
+class DenominationManager:
+    def __init__(self, denominations, file_path="denominations.csv"):
+        self.denominations = denominations
+        self.file_path = file_path
+        self.availability = self.load_denominations()
+
+    def load_denominations(self):
+        if os.path.exists(self.file_path):
+            with open(self.file_path, "r") as file:
+                reader = csv.reader(file)
+                return {int(row[0]): int(row[1]) for row in reader}
+        else:
+            return {denom: 50 for denom in self.denominations}
+
+    def save_denominations(self):
+        with open(self.file_path, "w", newline="") as file:
+            writer = csv.writer(file)
+            for denom, count in self.availability.items():
+                writer.writerow([denom, count])
+
+    def coins_system(self, amount):
+        result = {}
+        for coin in self.denominations:
+            if amount == 0:
+                break
+            if coin <= amount and self.availability.get(coin, 0) > 0:
+                max_coins = min(amount // coin, self.availability[coin])
+                if max_coins > 0:
+                    result[coin] = max_coins
+                    amount -= max_coins * coin
+                    self.availability[coin] -= max_coins
+        self.save_denominations()
+        if amount > 0:
+            return result, amount
+        return result
+
+    def reset_denominations(self):
+        self.availability = {denom: 50 for denom in self.denominations}
+        self.save_denominations()
+
+# User Class with withdrawal limits
 class User:
-    def __init__(self, name, pwd, card_number, pin, initial_balance=0):
+    def __init__(self, name, pin, card_number, password, email, balance):
         self.name = name
-        self.pwd = pwd
-        self.card_number = card_number
         self.pin = pin
-        self.balance = initial_balance
+        self.card_number = card_number
+        self.password = password
+        self.email = email
+        self.balance = balance
         self.transaction_history = []
-    
-    def checkPassword(self, pwd):
-        return self.pwd == pwd
-    
-    def checkPin(self, entered_pin):
-        return self.pin == entered_pin
-    
-    def updateBalance(self, amount, login_system):
-        """Update balance and save changes to CSV."""
+        self.locked = False
+        self.daily_withdrawn = 0
+        self.monthly_withdrawn = 0
+        self.daily_limit = 4000
+        self.monthly_limit = 100000
+        self.last_withdraw_date = None
+
+    def update_balance(self, amount):
         self.balance += amount
-        login_system.saveAllAccounts()  # Save to CSV after updating balance
-        return self.balance
-    
-    def getBalance(self):
-        return self.balance
-    
-    def addTransaction(self, transaction, login_system):
-        """Add a transaction to the history and save changes to CSV."""
-        self.transaction_history.append(transaction)
-        login_system.saveAllAccounts()  # Save to CSV after adding transaction
-    
-    def getTransactionHistory(self):
+
+    def reset_withdraw_limits(self):
+        """Reset daily and monthly withdrawal limits using datetime."""
+        now = datetime.now()
+        if not self.last_withdraw_date or self.last_withdraw_date.date() != now.date():
+            self.daily_withdrawn = 0
+        if not self.last_withdraw_date or self.last_withdraw_date.month != now.month:
+            self.monthly_withdrawn = 0
+        self.last_withdraw_date = now
+
+    def can_withdraw(self, amount):
+        """Check if the user can withdraw the requested amount."""
+        self.reset_withdraw_limits()
+        if self.locked:
+            return False, "Account is locked."
+        if amount > self.balance:
+            return False, "Insufficient balance."
+        if self.daily_withdrawn + amount > self.daily_limit:
+            return False, f"Daily withdrawal limit exceeded. You can withdraw up to ${self.daily_limit - self.daily_withdrawn} today."
+        if self.monthly_withdrawn + amount > self.monthly_limit:
+            return False, f"Monthly withdrawal limit exceeded. You can withdraw up to ${self.monthly_limit - self.monthly_withdrawn} this month."
+        return True, ""
+
+    def record_transaction(self, message):
+        """Record the transaction and update withdrawal limits."""
+        now = datetime.now()
+        self.reset_withdraw_limits()
+        self.transaction_history.append(f"{message} at {now}")
+        self.last_withdraw_date = now
+
+    def withdraw(self, amount):
+        """Perform the withdrawal if possible."""
+        can_withdraw, message = self.can_withdraw(amount)
+        if can_withdraw:
+            self.update_balance(-amount)
+            self.daily_withdrawn += amount
+            self.monthly_withdrawn += amount
+            self.record_transaction(f"Withdrew ${amount}")
+            return True, f"Successfully withdrew ${amount}."
+        return False, message
+
+    def get_transaction_history(self):
         return self.transaction_history
 
-# Define the Login class
-class Login:
-    def __init__(self, csv_file=r'D:\accounts.csv'):
-        self.accounts = {}
-        self.csv_file = csv_file
-        self.loadAccounts()
+    def check_password(self, password):
+        return self.password == password
 
-    def loadAccounts(self):
+# Admin Class
+class Admin:
+    def __init__(self, email, password, csv_file="users.csv"):
+        self.email = email
+        self.password = password
+        self.csv_file = csv_file
+        self.users = self.load_users()
+
+    def load_users(self):
+        users = {}
         if os.path.exists(self.csv_file):
-            with open(self.csv_file, mode='r') as file:
+            with open(self.csv_file, "r") as file:
                 reader = csv.reader(file)
                 for row in reader:
-                    if len(row) < 6:
-                        continue 
+                    if len(row) < 7:
+                        row.append("")
+                    name, pin, password, email, card_number, balance, history = row
+                    user = User(name, pin, card_number, password, email, float(balance))
+                    user.transaction_history = history.split("|") if history else []
+                    users[card_number] = user
+        return users
 
-                    name, pwd, card_number, pin, balance, history = row
-                    user = User(name, pwd, card_number, pin, float(balance))
-                    user.transaction_history = history.split("|")
-                    self.accounts[name] = user
-
-    def saveAllAccounts(self):
-        """Save all account data back to the CSV file."""
-        with open(self.csv_file, mode='w', newline='') as file:
+    def save_users(self):
+        with open(self.csv_file, "w", newline="") as file:
             writer = csv.writer(file)
-            for user in self.accounts.values():
-                writer.writerow([
-                    user.name, user.pwd, user.card_number, user.pin,
-                    user.balance, "|".join(user.transaction_history)
-                ])
+            for user in self.users.values():
+                writer.writerow([user.name, user.pin, user.password, user.email, user.card_number, user.balance, "|".join(user.transaction_history)])
 
-    def addAccount(self, userName, password, balance=0):
-        if userName in self.accounts:
-            print("Account already exists.")
-            return False
-        
-        # Generate a random card number and PIN
+    def add_user(self, name, password, email, balance=0):
+        pin = str(random.randint(1000, 9999))
         card_number = f"{random.randint(1000, 9999)}-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}-{random.randint(1000, 9999)}"
-        pin = f"{random.randint(1000, 9999)}"
-        
-        new_user = User(userName, password, card_number, pin, balance)
-        self.accounts[userName] = new_user
-        self.saveAllAccounts()  # Save new account to CSV
-        print(f"Account created successfully for {userName} with card number {card_number} and PIN {pin}.")
-        return True
+        new_user = User(name, pin, card_number, password, email, balance)
+        self.users[card_number] = new_user
+        self.save_users()
+        return new_user
 
-    def login(self, card_number, pin):
-        for user in self.accounts.values():
-            if user.card_number == card_number and user.checkPin(pin):
-                return user
-        return None
+    def delete_user(self, email):
+        self.users = {card_number: user for card_number, user in self.users.items() if user.email != email}
+        self.save_users()
 
-# Define the Bank class
-class Bank:
-    def __init__(self, login_system):
-        self.login_system = login_system
+    def lock_user(self, email):
+        for user in self.users.values():
+            if user.email == email:
+                user.locked = True
 
-    def getBalance(self, card_number, pin):
-        user = self.login_system.login(card_number, pin)
-        if user:
-            return user.getBalance()
-        return None
+    def unlock_user(self, email):
+        for user in self.users.values():
+            if user.email == email:
+                user.locked = False
 
-# GUI using Tkinter
-class ATM_GUI:
-    def __init__(self, root, login_system):
-        self.root = root
-        self.login_system = login_system
-        self.current_user = None
-        
-        self.root.title("ATM System")
-        self.root.geometry("400x300")
-        
-        self.create_main_menu()
+    def get_all_users(self):
+        return self.users
 
-    def create_main_menu(self):
-        self.clear_screen()
+    def check_password(self, password):
+        return self.password == password
 
-        tk.Label(self.root, text="ATM Main Menu").pack(pady=10)
-        
-        tk.Button(self.root, text="Login", command=self.create_login_screen).pack(pady=5)
-        tk.Button(self.root, text="Register", command=self.create_registration_screen).pack(pady=5)
+# Streamlit Pages
+st.session_state.setdefault("user", None)
+st.session_state.setdefault("admin", None)
 
-    def create_login_screen(self):
-        self.clear_screen()
-        
-        # Create login screen UI
-        tk.Label(self.root, text="Enter Card Number").pack(pady=10)
-        self.card_number_entry = tk.Entry(self.root)
-        self.card_number_entry.pack(pady=5)
-        
-        tk.Label(self.root, text="Enter PIN").pack(pady=10)
-        self.pin_entry = tk.Entry(self.root, show="*")
-        self.pin_entry.pack(pady=5)
-        
-        tk.Button(self.root, text="Login", command=self.login_user).pack(pady=20)
-        tk.Button(self.root, text="Back", command=self.create_main_menu).pack(pady=5)
+def welcome_page():
+    st.title("Welcome to DXMH Bank")
+    st.write("A trusted bank for all your financial needs.")
+    if st.button("Proceed to Login"):
+        st.session_state["page"] = "login"
 
-    def create_registration_screen(self):
-        self.clear_screen()
-        
-        tk.Label(self.root, text="Enter your name").pack(pady=10)
-        self.name_entry = tk.Entry(self.root)
-        self.name_entry.pack(pady=5)
-        
-        tk.Label(self.root, text="Enter password").pack(pady=10)
-        self.pwd_entry = tk.Entry(self.root, show="*")
-        self.pwd_entry.pack(pady=5)
-        
-        tk.Button(self.root, text="Register", command=self.register_user).pack(pady=20)
-        tk.Button(self.root, text="Back", command=self.create_main_menu).pack(pady=5)
+def login_page():
+    st.title("Login to DXMH Bank")
+    login_option = st.radio("Login as", ["User", "Admin"])
 
-    def register_user(self):
-        name = self.name_entry.get()
-        password = self.pwd_entry.get()
-
-        if name and password:
-            if self.login_system.addAccount(name, password):
-                user = self.login_system.accounts[name]
-                messagebox.showinfo("Account Created", 
-                    f"Account created successfully!\nCard Number: {user.card_number}\nPIN: {user.pin}")
-                self.create_main_menu()
+    if login_option == "User":
+        card_number = st.text_input("Enter your card number")
+        pin = st.text_input("Enter your PIN", type="password")
+        if st.button("Login"):
+            user = admin.users.get(card_number)
+            if user and user.pin == pin:
+                st.session_state["user"] = user
+                st.success(f"Welcome {user.name}!")
+                st.session_state["page"] = "user_dashboard"
             else:
-                messagebox.showerror("Error", "Account already exists.")
-        else:
-            messagebox.showwarning("Input Error", "Please enter both name and password.")
+                st.error("Invalid card number or PIN.")
 
-    def login_user(self):
-        card_number = self.card_number_entry.get()
-        pin = self.pin_entry.get()
-
-        if card_number and pin:
-            user = self.login_system.login(card_number, pin)
-            if user:
-                self.current_user = user
-                messagebox.showinfo("Success", f"Welcome {user.name}!")
-                self.create_user_menu()
+    elif login_option == "Admin":
+        email = st.text_input("Enter admin email")
+        password = st.text_input("Enter admin password", type="password")
+        if st.button("Login"):
+            if email == admin.email and admin.check_password(password):
+                st.session_state["admin"] = admin
+                st.success("Admin login successful!")
+                st.session_state["page"] = "admin_dashboard"
             else:
-                messagebox.showerror("Error", "Invalid card number or PIN")
-        else:
-            messagebox.showwarning("Input Error", "Please enter both card number and PIN")
+                st.error("Invalid admin credentials.")
 
-    def create_user_menu(self):
-        self.clear_screen()
+def user_dashboard():
+    user = st.session_state["user"]
+    st.sidebar.title(f"Welcome, {user.name}")
+    action = st.sidebar.radio("Actions", ["Check Balance", "Withdraw Money", "Deposit Money", "Transaction History", "Logout"])
 
-        # User Menu UI
-        tk.Label(self.root, text="ATM User Menu").pack(pady=10)
-        
-        tk.Button(self.root, text="Deposit", command=self.deposit_screen).pack(pady=5)
-        tk.Button(self.root, text="Withdraw", command=self.withdraw_screen).pack(pady=5)
-        tk.Button(self.root, text="Check Balance", command=self.check_balance).pack(pady=5)
-        tk.Button(self.root, text="Transaction History", command=self.transaction_history).pack(pady=5)
-        tk.Button(self.root, text="Logout", command=self.create_main_menu).pack(pady=20)
+    if action == "Check Balance":
+        st.write(f"Your current balance: ${user.balance:.2f}")
 
-    def deposit_screen(self):
-        self.clear_screen()
-
-        tk.Label(self.root, text="Enter amount to deposit").pack(pady=10)
-        self.amount_entry = tk.Entry(self.root)
-        self.amount_entry.pack(pady=5)
-
-        tk.Button(self.root, text="Deposit", command=self.deposit).pack(pady=10)
-        tk.Button(self.root, text="Back", command=self.create_user_menu).pack(pady=5)
-
-    def deposit(self):
-        amount = self.amount_entry.get()
-        if amount.isdigit():
-            amount = float(amount)
-            self.current_user.updateBalance(amount, self.login_system)  # Pass login_system
-            self.current_user.addTransaction(f"Deposited: {amount}", self.login_system)  # Pass login_system
-            messagebox.showinfo("Success", f"Deposited {amount}. New balance: {self.current_user.getBalance()}")
-        else:
-            messagebox.showerror("Error", "Invalid amount")
-
-        self.create_user_menu()
-
-    def withdraw_screen(self):
-        self.clear_screen()
-
-        tk.Label(self.root, text="Enter amount to withdraw").pack(pady=10)
-        self.amount_entry = tk.Entry(self.root)
-        self.amount_entry.pack(pady=5)
-
-        tk.Button(self.root, text="Withdraw", command=self.withdraw).pack(pady=10)
-        tk.Button(self.root, text="Back", command=self.create_user_menu).pack(pady=5)
-
-    def withdraw(self):
-        amount = self.amount_entry.get()
-        if amount.isdigit():
-            amount = float(amount)
-            if self.current_user.getBalance() >= amount:
-                self.current_user.updateBalance(-amount, self.login_system)  # Pass login_system
-                self.current_user.addTransaction(f"Withdrew: {amount}", self.login_system)  # Pass login_system
-                messagebox.showinfo("Success", f"Withdrew {amount}. New balance: {self.current_user.getBalance()}")
+    elif action == "Withdraw Money":
+        amount = st.number_input("Enter amount to withdraw", min_value=1)
+        if st.button("Withdraw"):
+            success, message = user.withdraw(amount)
+            if success:
+                st.success(message)
             else:
-                messagebox.showerror("Error", "Insufficient balance")
-        else:
-            messagebox.showerror("Error", "Invalid amount")
+                st.error(message)
 
-        self.create_user_menu()
+    elif action == "Deposit Money":
+        amount = st.number_input("Enter amount to deposit", min_value=1)
+        if st.button("Deposit"):
+            user.update_balance(amount)
+            user.record_transaction(f"Deposited ${amount}")
+            st.success(f"Successfully deposited ${amount}.")
 
-    def check_balance(self):
-        balance = self.current_user.getBalance()
-        messagebox.showinfo("Balance", f"Your balance is: {balance}")
+    elif action == "Transaction History":
+        st.write("Transaction History:")
+        for transaction in user.get_transaction_history():
+            st.write(transaction)
 
-    def transaction_history(self):
-        history = "\n".join(self.current_user.getTransactionHistory())
-        if history:
-            messagebox.showinfo("Transaction History", history)
-        else:
-            messagebox.showinfo("Transaction History", "No transactions found.")
+    elif action == "Logout":
+        st.session_state["user"] = None
+        st.session_state["page"] = "welcome"
 
-    def clear_screen(self):
-        for widget in self.root.winfo_children():
-            widget.destroy()
+def admin_dashboard():
+    st.sidebar.title("Admin Actions")
+    action = st.sidebar.radio("Actions", ["Add User", "Delete User", "Lock/Unlock User", "View Users", "Manage Denominations", "Logout"])
 
-# Initialize the application
-if __name__ == "__main__":
-    root = tk.Tk()
-    login_system = Login()
-    app = ATM_GUI(root, login_system)
-    root.mainloop()
+    if action == "Add User":
+        name = st.text_input("User's name")
+        email = st.text_input("User's email")
+        password = st.text_input("User's password")
+        balance = st.number_input("Initial balance", min_value=0.0)
+        if st.button("Add User"):
+            user = admin.add_user(name, password, email, balance)
+            st.success(f"User added: {user.name} (Card: {user.card_number}, PIN: {user.pin})")
+
+    elif action == "Delete User":
+        email = st.text_input("Email of user to delete")
+        if st.button("Delete User"):
+            admin.delete_user(email)
+            st.success(f"User with email {email} deleted.")
+
+    elif action == "Lock/Unlock User":
+        email = st.text_input("User's email")
+        lock_action = st.selectbox("Action", ["Lock", "Unlock"])
+        if st.button("Apply"):
+            if lock_action == "Lock":
+                admin.lock_user(email)
+                st.success(f"User with email {email} locked.")
+            elif lock_action == "Unlock":
+                admin.unlock_user(email)
+                st.success(f"User with email {email} unlocked.")
+
+    elif action == "View Users":
+        st.write("All Users:")
+        users_df = pd.DataFrame([user.__dict__ for user in admin.get_all_users().values()])
+        st.dataframe(users_df)
+
+    elif action == "Manage Denominations":
+        st.write("Current Denomination Status:")
+        st.write(denomination_manager.availability)
+
+        denomination = st.selectbox("Select Denomination to Update", denomination_manager.denominations)
+        count = st.number_input("Enter New Count", min_value=0)
+
+        if st.button("Update Denomination"):
+            denomination_manager.availability[denomination] = count
+            denomination_manager.save_denominations()
+            st.success(f"Updated {denomination} denomination count to {count}.")
+
+    elif action == "Logout":
+        st.session_state["admin"] = None
+        st.session_state["page"] = "welcome"
+
+# App Navigation
+admin = Admin("admin@dxmh.com", "admin123")
+denominations = [100, 50, 20, 10, 5, 1]
+denomination_manager = DenominationManager(denominations)
+
+if "page" not in st.session_state:
+    st.session_state["page"] = "welcome"
+
+if st.session_state["page"] == "welcome":
+    welcome_page()
+elif st.session_state["page"] == "login":
+    login_page()
+elif st.session_state["page"] == "user_dashboard":
+    user_dashboard()
+elif st.session_state["page"] == "admin_dashboard":
+    admin_dashboard()
